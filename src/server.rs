@@ -137,6 +137,73 @@ pub struct ActionsParams {
     pub per_page: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListCommitsParams {
+    #[schemars(description = "Repository owner (user or org)")]
+    #[serde(default)]
+    pub owner: Option<String>,
+
+    #[schemars(description = "Repository name")]
+    pub repo: String,
+
+    #[schemars(description = "Branch or tag name (default: repo's default branch)")]
+    #[serde(default)]
+    pub sha: Option<String>,
+
+    #[schemars(description = "Filter commits by author (GitHub username or email)")]
+    #[serde(default)]
+    pub author: Option<String>,
+
+    #[schemars(description = "Maximum number of results")]
+    #[serde(default)]
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitRefParams {
+    #[schemars(description = "Repository owner (user or org)")]
+    #[serde(default)]
+    pub owner: Option<String>,
+
+    #[schemars(description = "Repository name")]
+    pub repo: String,
+
+    #[schemars(description = "Commit SHA, branch name, or tag")]
+    #[serde(rename = "ref")]
+    pub sha: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RepoPageParams {
+    #[schemars(description = "Repository owner (user or org)")]
+    #[serde(default)]
+    pub owner: Option<String>,
+
+    #[schemars(description = "Repository name")]
+    pub repo: String,
+
+    #[schemars(description = "Maximum number of results")]
+    #[serde(default)]
+    pub per_page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileContentsParams {
+    #[schemars(description = "Repository owner (user or org)")]
+    #[serde(default)]
+    pub owner: Option<String>,
+
+    #[schemars(description = "Repository name")]
+    pub repo: String,
+
+    #[schemars(description = "File path within the repository")]
+    pub path: String,
+
+    #[schemars(description = "Git ref (branch, tag, or SHA). Defaults to the repo's default branch")]
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+}
+
 impl McpGithubServer {
     pub fn new(
         github: octocrab::Octocrab,
@@ -195,6 +262,27 @@ fn sanitize_github_name(name: &str, field: &str) -> Result<(), McpGithubError> {
             return Err(McpGithubError::MissingParam(format!(
                 "{} contains invalid character '{}'",
                 field, ch
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a value for use in URL paths or query params. Unlike
+/// `sanitize_github_name`, this allows slashes (for branch names like
+/// `feature/foo` or file paths like `src/main.rs`).
+fn sanitize_url_value(value: &str, field: &str) -> Result<(), McpGithubError> {
+    if value.is_empty() {
+        return Err(McpGithubError::MissingParam(format!(
+            "{} must not be empty",
+            field
+        )));
+    }
+    for ch in ['?', '#', '&', '\0', '\n', '\r', '\t'] {
+        if value.contains(ch) {
+            return Err(McpGithubError::MissingParam(format!(
+                "{} contains invalid character",
+                field
             )));
         }
     }
@@ -627,6 +715,328 @@ impl McpGithubServer {
         .unwrap_or_else(|_| "{}".to_string());
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
+
+    #[tool(
+        name = "list_commits",
+        description = "List commits on a branch or tag"
+    )]
+    async fn list_commits(
+        &self,
+        Parameters(params): Parameters<ListCommitsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self
+            .resolve_owner(params.owner.as_deref())
+            .map_err(|e| self.err(e))?;
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+
+        let per_page = self.capped_per_page(params.per_page);
+        let mut route = format!(
+            "/repos/{}/{}/commits?per_page={}",
+            owner, params.repo, per_page
+        );
+        if let Some(ref sha) = params.sha {
+            sanitize_url_value(sha, "sha").map_err(|e| self.err(e))?;
+            route.push_str(&format!("&sha={}", sha));
+        }
+        if let Some(ref author) = params.author {
+            sanitize_url_value(author, "author").map_err(|e| self.err(e))?;
+            route.push_str(&format!("&author={}", author));
+        }
+
+        let response: Vec<serde_json::Value> = self
+            .github
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
+
+        let commits: Vec<serde_json::Value> = response
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "sha": c.get("sha"),
+                    "message": c.pointer("/commit/message"),
+                    "author": c.pointer("/commit/author/name"),
+                    "author_login": c.pointer("/author/login"),
+                    "date": c.pointer("/commit/author/date"),
+                })
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "repo": format!("{}/{}", owner, params.repo),
+            "commits": commits,
+            "count": commits.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "get_commit",
+        description = "Get full commit details including changed files"
+    )]
+    async fn get_commit(
+        &self,
+        Parameters(params): Parameters<CommitRefParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self
+            .resolve_owner(params.owner.as_deref())
+            .map_err(|e| self.err(e))?;
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+        sanitize_url_value(&params.sha, "ref").map_err(|e| self.err(e))?;
+
+        let route = format!(
+            "/repos/{}/{}/commits/{}",
+            owner, params.repo, params.sha
+        );
+
+        let c: serde_json::Value = self
+            .github
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
+
+        let files = c
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "filename": f.get("filename"),
+                            "status": f.get("status"),
+                            "additions": f.get("additions"),
+                            "deletions": f.get("deletions"),
+                            "changes": f.get("changes"),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let file_count = files.len();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "sha": c.get("sha"),
+            "message": c.pointer("/commit/message"),
+            "author": c.pointer("/commit/author/name"),
+            "author_login": c.pointer("/author/login"),
+            "date": c.pointer("/commit/author/date"),
+            "parents": c.get("parents").and_then(|p| p.as_array()).map(|arr| {
+                arr.iter().filter_map(|p| p.get("sha")).collect::<Vec<_>>()
+            }),
+            "stats": c.get("stats"),
+            "files": files,
+            "file_count": file_count,
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "list_branches",
+        description = "List branches in a repository"
+    )]
+    async fn list_branches(
+        &self,
+        Parameters(params): Parameters<RepoPageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self
+            .resolve_owner(params.owner.as_deref())
+            .map_err(|e| self.err(e))?;
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+
+        let per_page = self.capped_per_page(params.per_page);
+        let route = format!(
+            "/repos/{}/{}/branches?per_page={}",
+            owner, params.repo, per_page
+        );
+
+        let response: Vec<serde_json::Value> = self
+            .github
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
+
+        let branches: Vec<serde_json::Value> = response
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "name": b.get("name"),
+                    "sha": b.pointer("/commit/sha"),
+                    "protected": b.get("protected"),
+                })
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "repo": format!("{}/{}", owner, params.repo),
+            "branches": branches,
+            "count": branches.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "get_file_contents",
+        description = "Get file content from a repository at a specific ref"
+    )]
+    async fn get_file_contents(
+        &self,
+        Parameters(params): Parameters<FileContentsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self
+            .resolve_owner(params.owner.as_deref())
+            .map_err(|e| self.err(e))?;
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+        sanitize_url_value(&params.path, "path").map_err(|e| self.err(e))?;
+
+        let mut route = format!(
+            "/repos/{}/{}/contents/{}",
+            owner, params.repo, params.path
+        );
+        if let Some(ref git_ref) = params.git_ref {
+            sanitize_url_value(git_ref, "ref").map_err(|e| self.err(e))?;
+            route.push_str(&format!("?ref={}", git_ref));
+        }
+
+        let response: serde_json::Value = self
+            .github
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
+
+        // Decode base64 content (GitHub returns base64 with embedded newlines)
+        let content = response
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| {
+                let cleaned: String = c.chars().filter(|ch| !ch.is_whitespace()).collect();
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(&cleaned)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .unwrap_or_else(|| "[binary content]".to_string())
+            })
+            .unwrap_or_default();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "path": response.get("path"),
+            "name": response.get("name"),
+            "size": response.get("size"),
+            "encoding": response.get("encoding"),
+            "content": content,
+            "sha": response.get("sha"),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "list_releases",
+        description = "List releases for a repository"
+    )]
+    async fn list_releases(
+        &self,
+        Parameters(params): Parameters<RepoPageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self
+            .resolve_owner(params.owner.as_deref())
+            .map_err(|e| self.err(e))?;
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+
+        let per_page = self.capped_per_page(params.per_page);
+        let route = format!(
+            "/repos/{}/{}/releases?per_page={}",
+            owner, params.repo, per_page
+        );
+
+        let response: Vec<serde_json::Value> = self
+            .github
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
+
+        let releases: Vec<serde_json::Value> = response
+            .iter()
+            .map(|r| {
+                let assets = r
+                    .get("assets")
+                    .and_then(|a| a.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "tag": r.get("tag_name"),
+                    "name": r.get("name"),
+                    "author": r.pointer("/author/login"),
+                    "prerelease": r.get("prerelease"),
+                    "draft": r.get("draft"),
+                    "published_at": r.get("published_at"),
+                    "asset_count": assets,
+                })
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "repo": format!("{}/{}", owner, params.repo),
+            "releases": releases,
+            "count": releases.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(
+        name = "list_tags",
+        description = "List tags in a repository"
+    )]
+    async fn list_tags(
+        &self,
+        Parameters(params): Parameters<RepoPageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let owner = self
+            .resolve_owner(params.owner.as_deref())
+            .map_err(|e| self.err(e))?;
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+
+        let per_page = self.capped_per_page(params.per_page);
+        let route = format!(
+            "/repos/{}/{}/tags?per_page={}",
+            owner, params.repo, per_page
+        );
+
+        let response: Vec<serde_json::Value> = self
+            .github
+            .get(&route, None::<&()>)
+            .await
+            .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
+
+        let tags: Vec<serde_json::Value> = response
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.get("name"),
+                    "sha": t.pointer("/commit/sha"),
+                })
+            })
+            .collect();
+
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "repo": format!("{}/{}", owner, params.repo),
+            "tags": tags,
+            "count": tags.len(),
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
 }
 
 #[tool_handler]
@@ -642,8 +1052,11 @@ impl ServerHandler for McpGithubServer {
             },
             instructions: Some(
                 "GitHub server. Use list_repos to see repositories, get_repo for repo details, \
-                 list_issues and get_issue for issues, list_pulls and get_pull for PRs, \
-                 search_code to search code, and list_actions_runs for CI/CD runs."
+                 list_issues/get_issue for issues, list_pulls/get_pull for PRs, \
+                 search_code to search code, list_actions_runs for CI/CD runs, \
+                 list_commits/get_commit for commit history, list_branches for branches, \
+                 get_file_contents to read files, list_releases for releases, \
+                 and list_tags for tags."
                     .to_string(),
             ),
         }
@@ -744,5 +1157,34 @@ mod tests {
     fn test_sanitize_github_name_whitespace() {
         assert!(sanitize_github_name("my repo", "repo").is_err());
         assert!(sanitize_github_name("my\nrepo", "repo").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_url_value_valid() {
+        assert!(sanitize_url_value("main", "sha").is_ok());
+        assert!(sanitize_url_value("feature/foo", "sha").is_ok());
+        assert!(sanitize_url_value("src/main.rs", "path").is_ok());
+        assert!(sanitize_url_value("user@example.com", "author").is_ok());
+    }
+
+    #[test]
+    fn test_sanitize_url_value_empty() {
+        assert!(sanitize_url_value("", "sha").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_url_value_dangerous_chars() {
+        assert!(sanitize_url_value("main?evil=1", "sha").is_err());
+        assert!(sanitize_url_value("main#frag", "sha").is_err());
+        assert!(sanitize_url_value("val&other=1", "author").is_err());
+        assert!(sanitize_url_value("val\0x", "path").is_err());
+        assert!(sanitize_url_value("val\nx", "path").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_url_value_allows_slashes() {
+        // Unlike sanitize_github_name, slashes are allowed for branch names and file paths
+        assert!(sanitize_url_value("feature/my-branch", "sha").is_ok());
+        assert!(sanitize_url_value("src/lib/utils.rs", "path").is_ok());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "mcp-github"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "MCP server that lets LLMs interact with GitHub repositories, issues, and pull requests"
@@ -24,3 +24,4 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+base64 = "0.22"
