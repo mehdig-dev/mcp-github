@@ -162,10 +162,46 @@ impl McpGithubServer {
             })
     }
 
+    /// Cap per_page to 100 (GitHub API maximum) and safely cast to u8.
+    fn capped_per_page(&self, per_page: Option<u32>) -> u8 {
+        std::cmp::min(per_page.unwrap_or(self.max_results), 100) as u8
+    }
+
     fn err(&self, e: McpGithubError) -> ErrorData {
         e.to_mcp_error()
     }
 }
+
+/// Format an issue/PR state as a lowercase string.
+fn format_state(state: &octocrab::models::IssueState) -> &'static str {
+    match state {
+        octocrab::models::IssueState::Open => "open",
+        octocrab::models::IssueState::Closed => "closed",
+        _ => "unknown",
+    }
+}
+
+/// Validate that a GitHub owner/repo name doesn't contain characters that
+/// could be used for URL injection in raw API routes.
+fn sanitize_github_name(name: &str, field: &str) -> Result<(), McpGithubError> {
+    if name.is_empty() {
+        return Err(McpGithubError::MissingParam(format!(
+            "{} must not be empty",
+            field
+        )));
+    }
+    for ch in ['/', '?', '#', '%', '\0', ' ', '\n', '\t'] {
+        if name.contains(ch) {
+            return Err(McpGithubError::MissingParam(format!(
+                "{} contains invalid character '{}'",
+                field, ch
+            )));
+        }
+    }
+    Ok(())
+}
+
+// -- MCP tool handlers (thin wrappers calling do_* methods) --
 
 #[tool_router]
 impl McpGithubServer {
@@ -181,11 +217,13 @@ impl McpGithubServer {
             .resolve_owner(params.owner.as_deref())
             .map_err(|e| self.err(e))?;
 
+        let per_page = self.capped_per_page(None);
+
         let page = self
             .github
             .orgs(&owner)
             .list_repos()
-            .per_page(self.max_results as u8)
+            .per_page(per_page)
             .send()
             .await;
 
@@ -196,7 +234,7 @@ impl McpGithubServer {
                 self.github
                     .users(&owner)
                     .repos()
-                    .per_page(self.max_results as u8)
+                    .per_page(per_page)
                     .send()
                     .await
                     .map_err(|e| self.err(McpGithubError::GitHub(e)))?
@@ -276,10 +314,10 @@ impl McpGithubServer {
             .resolve_owner(params.owner.as_deref())
             .map_err(|e| self.err(e))?;
 
+        let per_page = self.capped_per_page(params.per_page);
+
         let issue_handler = self.github.issues(&owner, &params.repo);
-        let mut request = issue_handler
-            .list()
-            .per_page(params.per_page.unwrap_or(self.max_results) as u8);
+        let mut request = issue_handler.list().per_page(per_page);
 
         if let Some(ref state) = params.state {
             request = match state.as_str() {
@@ -309,7 +347,7 @@ impl McpGithubServer {
                 serde_json::json!({
                     "number": i.number,
                     "title": i.title,
-                    "state": format!("{:?}", i.state),
+                    "state": format_state(&i.state),
                     "author": i.user.login,
                     "labels": labels,
                     "comments": i.comments,
@@ -372,7 +410,7 @@ impl McpGithubServer {
         let text = serde_json::to_string_pretty(&serde_json::json!({
             "number": issue.number,
             "title": issue.title,
-            "state": format!("{:?}", issue.state),
+            "state": format_state(&issue.state),
             "author": issue.user.login,
             "labels": labels,
             "body": issue.body.as_deref().unwrap_or(""),
@@ -395,10 +433,10 @@ impl McpGithubServer {
             .resolve_owner(params.owner.as_deref())
             .map_err(|e| self.err(e))?;
 
+        let per_page = self.capped_per_page(params.per_page);
+
         let pulls_handler = self.github.pulls(&owner, &params.repo);
-        let mut request = pulls_handler
-            .list()
-            .per_page(params.per_page.unwrap_or(self.max_results) as u8);
+        let mut request = pulls_handler.list().per_page(per_page);
 
         if let Some(ref state) = params.state {
             request = match state.as_str() {
@@ -421,7 +459,7 @@ impl McpGithubServer {
                 serde_json::json!({
                     "number": p.number,
                     "title": p.title.as_deref().unwrap_or(""),
-                    "state": format!("{:?}", p.state.as_ref()),
+                    "state": p.state.as_ref().map(format_state).unwrap_or("unknown"),
                     "author": p.user.as_ref().map(|u| u.login.as_str()).unwrap_or("unknown"),
                     "head": p.head.ref_field,
                     "base": p.base.ref_field,
@@ -462,7 +500,7 @@ impl McpGithubServer {
         let text = serde_json::to_string_pretty(&serde_json::json!({
             "number": pr.number,
             "title": pr.title.as_deref().unwrap_or(""),
-            "state": format!("{:?}", pr.state.as_ref()),
+            "state": pr.state.as_ref().map(format_state).unwrap_or("unknown"),
             "author": pr.user.as_ref().map(|u| u.login.as_str()).unwrap_or("unknown"),
             "body": pr.body.as_deref().unwrap_or(""),
             "head": pr.head.ref_field,
@@ -499,11 +537,13 @@ impl McpGithubServer {
             }
         }
 
+        let per_page = self.capped_per_page(params.per_page);
+
         let results = self
             .github
             .search()
             .code(&query)
-            .per_page(params.per_page.unwrap_or(self.max_results) as u8)
+            .per_page(per_page)
             .send()
             .await
             .map_err(|e| self.err(McpGithubError::GitHub(e)))?;
@@ -542,11 +582,15 @@ impl McpGithubServer {
             .resolve_owner(params.owner.as_deref())
             .map_err(|e| self.err(e))?;
 
+        // Validate owner and repo to prevent URL injection in raw route
+        sanitize_github_name(&owner, "owner").map_err(|e| self.err(e))?;
+        sanitize_github_name(&params.repo, "repo").map_err(|e| self.err(e))?;
+
+        let per_page = self.capped_per_page(params.per_page);
+
         let route = format!(
             "/repos/{}/{}/actions/runs?per_page={}",
-            owner,
-            params.repo,
-            params.per_page.unwrap_or(self.max_results)
+            owner, params.repo, per_page
         );
 
         let response: serde_json::Value = self
@@ -603,5 +647,102 @@ impl ServerHandler for McpGithubServer {
                     .to_string(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server(default_owner: Option<String>, max_results: u32) -> McpGithubServer {
+        let github = octocrab::Octocrab::default();
+        McpGithubServer::new(github, default_owner, max_results)
+    }
+
+    // Note: Octocrab::default() requires a Tokio runtime (tower::Buffer),
+    // so these tests must be async even though they don't await anything.
+
+    #[tokio::test]
+    async fn test_resolve_owner_with_param() {
+        let server = make_server(None, 30);
+        let result = server.resolve_owner(Some("my-org"));
+        assert_eq!(result.unwrap(), "my-org");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_owner_with_default() {
+        let server = make_server(Some("default-org".to_string()), 30);
+        let result = server.resolve_owner(None);
+        assert_eq!(result.unwrap(), "default-org");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_owner_param_overrides_default() {
+        let server = make_server(Some("default-org".to_string()), 30);
+        let result = server.resolve_owner(Some("explicit-org"));
+        assert_eq!(result.unwrap(), "explicit-org");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_owner_missing() {
+        let server = make_server(None, 30);
+        let result = server.resolve_owner(None);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_capped_per_page_default() {
+        let server = make_server(None, 30);
+        assert_eq!(server.capped_per_page(None), 30);
+    }
+
+    #[tokio::test]
+    async fn test_capped_per_page_explicit() {
+        let server = make_server(None, 30);
+        assert_eq!(server.capped_per_page(Some(50)), 50);
+    }
+
+    #[tokio::test]
+    async fn test_capped_per_page_caps_at_100() {
+        let server = make_server(None, 30);
+        assert_eq!(server.capped_per_page(Some(200)), 100);
+        assert_eq!(server.capped_per_page(Some(1000)), 100);
+    }
+
+    #[tokio::test]
+    async fn test_capped_per_page_max_results_capped() {
+        // Even if max_results is set high, it should be capped at 100
+        let server = make_server(None, 500);
+        assert_eq!(server.capped_per_page(None), 100);
+    }
+
+    #[test]
+    fn test_sanitize_github_name_valid() {
+        assert!(sanitize_github_name("my-org", "owner").is_ok());
+        assert!(sanitize_github_name("user_name", "owner").is_ok());
+        assert!(sanitize_github_name("repo.name", "repo").is_ok());
+    }
+
+    #[test]
+    fn test_sanitize_github_name_empty() {
+        assert!(sanitize_github_name("", "owner").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_github_name_slash() {
+        assert!(sanitize_github_name("owner/repo", "owner").is_err());
+        assert!(sanitize_github_name("../etc", "owner").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_github_name_query() {
+        assert!(sanitize_github_name("owner?evil=1", "owner").is_err());
+        assert!(sanitize_github_name("repo#fragment", "repo").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_github_name_whitespace() {
+        assert!(sanitize_github_name("my repo", "repo").is_err());
+        assert!(sanitize_github_name("my\nrepo", "repo").is_err());
     }
 }
